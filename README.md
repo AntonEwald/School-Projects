@@ -16,4 +16,4 @@ Some previous school projects in Machine Learning
 [Kernel PCA](https://github.com/AntonEwald/School-Projects/blob/main/Unsupervised%20Learning/Project%202/Project2.pdf)
 
 # Supervised Learning
-[Gradient Boosted Trees](Generalized Boosted Regression Models)
+[Gradient Boosted Trees](https://github.com/AntonEwald/School-Projects/blob/main/Statistical%20Learning/Labb%204/Project-4.pdf)
