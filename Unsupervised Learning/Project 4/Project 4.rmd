@@ -1,0 +1,692 @@
+---
+title: "Unsupervised Learning VT21 Project 4"
+subtitle: Finding Clusters in Erythematos Squamous Diseases with Spectral Clustering
+author: "Anton Holm Klang, Laimei Yip Lundstrom"
+date: "2/19/2021"
+geometry: margin = 1.8cm
+header-includes:
+  - \usepackage[font={small}]{caption}
+output:
+  pdf_document: default
+  html_document: default
+fontsize: 10pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE)
+```
+
+```{r library, message=FALSE}
+library(tidyverse)
+library(knitr)
+library(gridExtra)
+library(ggplot2)
+library(MASS)
+library(cccd)
+library(cluster)
+library(factoextra)
+library(ggrepel)
+```
+
+# **INTRODUCTION**
+
+Erythemato-squamous diseases is a group of common skin diseases that have very similar symptoms. In pratice, when diagnosing patients suffering from these diseases, it is hard for clinicians to distinguish which disease classes the patients belong to. While the current classification consists of six classes, we wonder if this is really the case or will some clustering methods discover some hidden structure in the data that is oblivious to the practitioners. This project sets out to mine a set of clinical data using spectral clustering to attest to the current number of disease classes. We get the result of 7 clusters. External validation of our clustering results shows that all but one of the clusters are quite pure and the disease class psoriasis is split into two clusters. Internal validation shows mediocre clustering quality due to a particular cluster being very dispersed and also two clusters being very close to each other.   Finally, the possible reasons for this discrepancy is discussed and suggestions for other methods that may also be suited to perform clustering on this type of data set are also discussed.
+
+# **DATA**
+
+The data for this project is retrieved from the ICU Machine Learning Repository and is named "Dermatology Data Set". The original data set consists of 366 observations of which each is a tuple of 35 elements with 1 response variable and 34 input variables. The response variable is a discrete variable with 6 nominal levels, each corresponding to a disease class. 32 of the predictor variables are ordinal with levels between 0 and 3 where 0 indicates that the symptom is not present and 3 the largest amount of the symptom is present. Input variable _family history_ is binary while _age_ is integer-valued. There are 8 observations with missing values in the input variable _age_. Since this number is not large, we take the approach of removing them completely from the data set. Figure 1 shows the number of observations in each disease class and a complete list of input variables is available in the appendix.
+
+
+```{r rawData}
+##############################################################
+# load data into workspace
+##############################################################
+data <- read.table("dermatology.data", sep = ",") %>% 
+  rename(class = V35) %>% 
+  relocate(class, everything()) %>%# remove missing values. 8 of them.
+  filter(V34 != "?") %>% 
+  mutate(V34 = as.double(V34))
+```
+
+
+```{r exploratory, fig.cap = "A simple analysis of the data set.", fig.dim=c(6,2)}
+##############################################################
+# exploratory analysis
+##############################################################
+# table of class names
+class.names <- tibble(Class = seq(1,6),
+                      Name = c("Psoriasis", "Seboreic Dermatitis ",
+                               "Lichen Planus", "Pityriasis Rosea",
+                               "Chronic Dermatitis", "Pityriasis Rubra Pilaris"),
+                      `No. of instances` = c(112, 61, 72, 49, 52, 20)) %>% 
+  tableGrob(theme=ttheme_minimal(base_size = 10), rows = NULL)
+
+# distribution of classes
+empi.class <- ggplot(data = data) +
+  geom_bar(aes(x = class, y = ..prop..), width = 0.5) +
+  theme(plot.background = element_blank(),
+        plot.title = element_text(size=10),
+        axis.title = element_text(size=8)) +
+  labs(title = "Empirical distribution of classes",
+       y = "proportion")+
+  scale_x_continuous(breaks = seq(1,6))
+grid.arrange(class.names, empi.class, ncol = 2)
+```
+
+# **METHOD SELECTION**
+
+In deciding which method to apply to our dataset, we take into consideration the inherent characteristics of our dataset and the methods we have in our toolbox at the start of the project. Below is a list of some of the methods that we have considered.
+
+- *K-means*: In order to use this method we need data to be gaussian, be balanced and lie in the euclidean space, just to name a few of the constraints. Since our data contains mainly of ordinal variables, it clearly is not gaussian. Besides, it is not balanced and it is difficult to ascertain if the data points population have spherical symmetric shapes. Hence, the euclidean assumption cannot be ascertain and as such we refrained from using k-means.
+
+- *GMM*: Since the dataset does not come from any gaussian distributed random variables, we refrain from using GMM.
+
+- *K-medoid*: Similar to the case of k-means, k-medoid works on spherical symmetric data. Since this is not the case for our dataset, this is not a suitable method.
+
+
+- *Non-metric MDS*: This is a method we think could be suitable since it applies specifically to ordinal data. However, we do not have enough information about monotonic regression to fully grasp the theory behind this method. We therefore decide that it is better to instead use a method that we completely understand.
+
+From the lectures we attended, we find graph-based methods quite promising. The idea of looking at small neighbourhoods means that we can use euclidean distance since any surface is "flat" locally. At the same time, spectral clustering is the method we are most familiar with, which is why we decide to use this method.
+
+## *Spectral Clustering*
+
+We choose to use $L_{sym}$. This is because the degree distribution carry information about where the data points are actually located in the high dimensional space. Since $L_{sym}$ takes into account the degree of every point, it is preferred over $L$. Plus, $L_{sym}$ does not scale with the size of the data set. Hence, its results are less sensitive to changes in the size of the data set. Also, we are aware of the problem of higher value eigenvectors exhibiting singular behaviour (cf von Luxburg [2] Figure 1 and Figure 5), which is undesirable in the event they are included as the first leading $k$ eigenvectors. For these reasons, we find that it is better to use $L_{sym}$.
+
+The most important input in spectral clustering is the similarity matrix. Hence, we make sure the similarity matrix is constructed correctly. Since we have a mixture of variable types, we need to construct similarity measure for each type. Take note that we interchange the use of "dissimilarity" and "similarity", but all in all, we mean the "distance" between two objects in a dataset.
+
+- *Ordinal:*
+All but two of the input variables in the dataset are ordinal variables. We use Eq (14.23) in Hastie, Tibshirani and Friedman [1] to transform variables of this type to quantitative variables, i.e., for element $i$ in the vector of variable $p$
+$$
+x_{ip} = \frac{x_{ip} - 1/2}{\text{number of levels}}.
+$$
+From here, we construct a dissimilarity matrix using euclidean distance.
+
+- *Nominal:*
+Family history is a binary variable. We use the dissimilarity measure described in Hastie, Tibshirani and Friedman [1], Section 14.3.2 for categorical variables. In our case, we get a $2 \times 2$ matrix for every pair of data points. To illustrate, for a pair of data points $x_i$ and $x_j$, if they have the same value, then $d(x_i, x_j) = 0$. If they have opposite values, then $d(x_i, x_j) = 1$.
+
+- *Interval-scaled:*
+Age is an interval-scaled variable. The dissimilarity between two points is computed as 
+$$
+d(x_i, x_j) = \frac{|x_i - x_j|}{max_{age} - min_{age}}.
+$$
+
+We take the absolute value since dissimilarities should be non-negative. Division with a constant is to remove the "age" scale so that the dissimilarity is now just a proportion. We can read it off as "the difference in age between subject $i$ and subject $j$ as a proportion of the available range of ages of all subjects".
+
+After we have computed pairwise dissimilarities for all the different input variables, we combine all of them to give an overall dissimilarity measure between two data points. Following the notation in Eq (14.24) in [1], the object dissimilarity between $x_i$ and $x_j$ is
+$$
+D(x_i, x_j) = \sum_{p=1}^{P} \omega_p d(x_{ip}, x_{jp}), \ \sum_{p} \omega_p = 1,
+$$
+
+where $p$ denotes the input variable for $P$ number of input variables and $\omega_p$ denotes the weight of the $p$th variable. We choose to use $\omega_p = 1/P$ to keep things simple and also to avoid distorting the underlying influence of each input variable. The entries in the similarity matrix that is used to construct the similarity graph and subsequently the weighted adjacency matrix consists of these $\{D(x_i, x_j) \}$'s.
+
+We choose to use the k-nearest neighbour to construct our similarity graph. With the similarity matrix that we have constructed above, we feed it into our own function to find the smallest possible $k$ neighbours such that we get a single component in the graph. We get $k=4$ neighbours, which is quite reasonable for our dataset with 358 datapoints. It is unlikely that there are short circuits formed with such a small number of neighbours. Further, we use the edge weights $w_{ij} = 1/D(x_i, x_j)^2$, as recommended by Chun, in constructing the weighted adjacency matrix. 
+
+Since we expect the reader of this report to be familiar with the spectral clustering algorithm presented in [2], we will not repeat it here and refer the reader to the tutorial for details. 
+
+```{r dataPrep}
+##############################################################
+# transform ordinal input variables into quantitative ones
+# Ref: ESL Eq (14.23)
+##############################################################
+# nr of levels for all input variables except for age and
+  # family history
+levels <- 4
+ordinal.data <- data %>% 
+  dplyr::select(c(V1:V10, V12:V33)) %>% 
+  mutate(across(everything(), ~(.+1)/levels - 0.5/levels))
+```
+
+```{r similarityMat}
+##############################################################
+# construct similarity matrix of mixed variable types
+# family history is binary
+# age is integer
+# the rest are ordinal
+##############################################################
+# Ref:http://hanj.cs.illinois.edu/cs412/bk3/02.pdf
+famhist.dist <- as.matrix(dist(data$V11, method = "binary"))
+age.dist <- abs((t(data$V34)[rep(1:nrow(t(data$V34)), 358),] - data$V34)) / 
+  (max(data$V34) - min(data$V34))
+ordinal.dist <- as.matrix(dist(ordinal.data, method = "euclidean"))
+
+#final similarity matrix
+simMat <- (famhist.dist+age.dist+ordinal.dist)/34
+```
+
+
+```{r simgraphfun}
+#######################################################
+# function that constructs knn similarity graph and 
+  # no. of components in graph
+# arg: sim.matrix = similarity matrix S
+#      k = number of neighbours
+#######################################################
+# Ref: http://www.di.fc.ul.pt/~jpn/r/spectralclustering/spectralclustering.html
+knn.graph <- function(sim.matrix, k) {
+  S <- matrix(rep(0, nrow(sim.matrix)^2), 
+              ncol = ncol(sim.matrix))
+  for (i in 1:nrow(sim.matrix)) {
+    # find k closest neighbour, excluding yourself
+    close.neigh <- sort(sim.matrix[i,])[2:(k+1)]
+    for (c in close.neigh) {
+      j <- which(sim.matrix[i,] == c)
+      S[i,j] <- 1
+      S[j,i] <- 1
+    }
+  }
+  graph1 <- graph_from_adjacency_matrix(S,
+                                        mode = "undirected")
+  return(list(S,count_components(graph1)))
+}
+```
+
+
+```{r weightsNdegree}
+#######################################################
+# construct knn similarity graph for Ery Squamous data
+# compute weight adjacency matrix W 
+# compute degree matrix D 
+#######################################################
+# start from k=1, loop until one connected component
+k.neigh <- 1
+graph <- knn.graph(simMat, k.neigh)
+# number of connected components per change of k
+comp <- c(graph[[2]])
+while(graph[[2]] > 1) {
+  k.neigh <- k.neigh + 1
+  graph <- knn.graph(simMat, k.neigh)
+  comp <- c(comp, graph[[2]])
+}
+# weights matrix for all data points
+weights <- 1/simMat^2 %>% 
+  replace(., col(.) == row(.), 1)
+
+# weights adjacency matrix
+W <- weights*graph[[1]]
+  
+# degree matrix 
+D <- diag(rowSums(W))
+```
+
+
+```{r normLaplacian}
+##############################################################
+# the normalized Laplacian
+##############################################################
+set.seed(123)
+# unnormalized Laplacian
+L <- D - W
+# normalized Laplacian
+Lsym <- sqrt(solve(D)) %*% L %*% sqrt(solve(D))
+Lsym.decomp <- eigen(Lsym, symmetric = TRUE)
+```
+
+
+```{r eigenvalPlot, fig.cap="The first 10 eigenvalues of the normalized Laplacian.", fig.dim=c(4,2)}
+##############################################################
+# eigengap check
+##############################################################
+ggplot(as_tibble(Lsym.decomp$values[358:349], .name_repair = "unique"), 
+       aes(x = as.factor(seq(1,10)), y = value)) +
+  geom_point() +
+  labs(x = "Index")
+```
+
+
+```{r Umat}
+##############################################################
+# construct U matrix 
+##############################################################
+# based on the eigengap heuristics, cluster k=7
+# but we use the first 7 eigenvectors
+U.mat <- as_tibble(Lsym.decomp$vectors[,358:352]) %>% 
+  mutate(across(everything(), 
+                ~. / sqrt(V1^2 + V2^2 + V3^2 + V4^2 + V5^2 +
+                            V6^2 + V7^2))) %>% 
+  rename_with(., ~gsub("V", "U",.x))
+```
+
+
+\pagebreak
+# **RESULTS AND VALIDATION**
+
+Figure 2 shows values of the first 10 eigenvalues of $L_{sym}$. The eigengap heuristics suggests that there are 7 clusters in the dataset. Before performing k-means clustering, we hope to get an idea of where and how these 7 clusters may look like and hence we look at the transformed data points, i.e. the $U$ matrix, from different 2-dimensional views. See Figure 3. We can clearly see some clustering structure, particularly in the top two panels. However, it is difficult to see which are the 7 clusters. 
+
+```{r UmatPlots, fig.cap="Second dimension of the U matrix against the next 4 dimensions. U matrix is obtained from the normalized Laplacian."}
+##############################################################
+# plots of second eigenvec of Lsym against 4 other smallest
+##############################################################
+vec.list <- purrr::map(seq.int(3, 6), ~paste0("U", .x))
+vec.nr <- seq.int(3,6)
+project1 <- purrr::map2(vec.list, vec.nr,
+                  ~ggplot(U.mat, 
+                          aes_string(x = "U2", y = .x)) +
+  geom_point() +
+  labs(x = "U2",
+       y = paste0("U", .y)))
+
+grid.arrange(grobs = project1, nrow = 2)
+```
+
+
+```{r kmeans, fig.cap="Spectral clustering results with k=7 clusters. The number of clusters is derived from eigengap heuristics."}
+##############################################################
+# clustering using kmeans
+##############################################################
+set.seed(123)
+kmeans1 <- kmeans(as.matrix(U.mat), centers = 7) 
+clus.results <- data %>% 
+  dplyr::select(class) %>% 
+  mutate(cluster = as.factor(kmeans1$cluster)) %>% 
+  group_by(cluster) %>% 
+  group_split()
+
+clus.plots <- map2(clus.results, 
+                   seq(1, 7), ~ggplot(.x, aes(as.factor(class))) +
+                    geom_bar() + 
+                    labs(title = paste0("cluster", .y),
+                         x = "disease class"))
+grid.arrange(grobs = clus.plots, nrow = 2)
+```
+
+
+
+```{r UmatPlotslabels, fig.cap="Second dimension of the U matrix against the next 2 dimensions with disease classes. Numerical labels indicate cluster assignment, while colour labels indicate disease class. U matrix is obtained from the normalized Laplacian.", fig.dim=c(8,4)}
+##############################################################
+# plots of second eigenvec of Lsym against 4 other smallest
+# with disease classes
+##############################################################
+project.labels <- purrr::map2(vec.list[1:2], vec.nr[1:2],
+                  ~ggplot(bind_cols(U.mat, 
+                                    tibble(class = as.factor(data$class)),
+                                    tibble(cluster = as.factor(kmeans1$cluster))), 
+                          aes_string(x = "U2", y = .x, color = "class", label = "cluster")) +
+  geom_text(key_glyph = "point", size = 3) +
+    scale_color_brewer(palette = "Dark2") +
+  labs(x = "U2",
+       y = paste0("U", .y),
+       color = "Disease class") +
+  theme(legend.title = element_text(size = 8),
+        legend.text = element_text(size = 6)))
+
+grid.arrange(grobs = project.labels, ncol = 2)
+```
+
+
+
+Figure 5 shows the final results of spectral clustering, after we have applied k-means clustering with $k=7$ clusters. The result is rather unexpected: cluster 7 is made up of very dispersed data points and there is heavy overlap between cluster 3 and 6. On the other hand, we can also see two very distinct cluster, namely cluster 2 and 4. 
+
+
+
+```{r wsstable}
+##############################################################
+# within-ss table 
+##############################################################
+wss.tab <- as_tibble(t(round(kmeans1$withinss, 2)), .name.repair = "unique")
+colnames(wss.tab) <- map(seq(1,7), ~paste0("cluster ", .x))
+kable(wss.tab, caption = "Within cluster sum of squares")
+```
+
+
+In order to have a preliminary understanding of the inherent characteristics of the clusters, we look at the individual within-cluster-sum-of-squares (WSS). See Table 1. We can see that cluster 4 and 7 have relatively large WSS, which implies that they are probablity not very compact. Cluster 7, in particular, seems to be a very dispersed cluster. We choose not to look at the between-clusters-sum-of-squares as we know that this sum can be dominated by clusters that are big and far apart from its neighbouring clusters.
+
+
+
+```{r silhouette, fig.cap="Table 2 shows the number of data points in each cluster and its corresponding silhouette coefficient. Plot shows the sign and magnitude of silhouette coefficient of every data point.", fig.dim=c(8,4)}
+##############################################################
+# compute sillouette coeff for every transformed data point
+# silhoutte plot
+##############################################################
+sil.coeff <- cluster::silhouette(kmeans1$cluster, dmatrix = simMat)
+fviz_silhouette(sil.coeff, ggtheme = theme_classic(), print.summary = F)
+sil.tab <- tibble(cluster = seq(1,7),
+                   `silhouette coeff` = c(0.22, 0.40, 0.15, 0.37,
+                                          0.22, 0.12, 0.11),
+                   `cluster size` = c(79, 31, 62, 71, 49, 43, 23)) %>% 
+  kable(caption = "Silhouette coefficients of each cluster")
+```
+
+`r sil.tab`
+
+
+```{r distbtwncluster}
+##############################################################
+# distance between cluster centers
+##############################################################
+clus.centers <- as.matrix(dist(kmeans1$centers, 
+                     method = "euclidean"))%>% 
+  as_tibble(.name_repair = "minimal") %>% 
+  mutate(cluster = seq(1,7)) %>% 
+  mutate(across(everything(), ~round(.,3))) %>% 
+  relocate(cluster) %>% 
+  kable(caption = "Distance between cluster centers")
+```
+
+Since we have the disease class labels in the dataset, we first carry out an external validation. We do this by comparing our clusters to the class labels presented by the clinicians. See Figure 4. According to the dataset, there are 6 disease classes but our results show 7 clusters. Most of the clusters are quite pure, with the exception of cluster 3, where 29% of its data points is not from disease class 4. Also, disease class 1, which is psoriasis, is split into two pure clusters. While external validation facilitates "reality" check, we also want to validate the quality of the clustering from a "cohesion-separation" perspective, which leads us to use the silhouette plots. In particular, we want to see if there are outliers and overlaps in the clusters. See Figure 6. The average silhouette coefficient is only 0.23, which indicates very mediocre overall clustering results. A closer look at the silhouette coefficients of every cluster (Table 2) shows exceptionally bad performance at cluster 3, 6 and 7. This concurs with our observation of these 3 clusters in Figure 5. We can see that there are number of data points that have negative silhouette coefficients, which implies that they are far away from its own cluster and closer to the neighbouring cluster. For cluster 3 and 6, supported by evidence from Figure 5, there is clearly overlap between them. We support this finding by also looking at the distance between the two cluster centers. See Table 3. Clearly, cluster 3 and 6 are very close to each other. Cluster 7, as we have noticed also in Figure 5, is particularly problematic as it has a sizable number of data points with negative silhouette coefficients.
+
+\pagebreak
+
+`r clus.centers`
+
+# **DISCUSSION**
+
+First of all we need to realize that we are no experts in the field of dermatology. Hence, any findings we get will have to be brought up to the clinicians for discussion should this be a real scenario.
+
+First, there are two different clusters that consists purely of patients diagnosed with psoriasis. There are a few possible reasons. First, there is a possibility that these are two different types of psoriasis that has simply been grouped together under one category. We see evidence in the distance between centers of these two clusters that they are not close to each other, which leads us to believe that there are two distinct groups in the psoriasis disease class. Second, there could be two groups that have different severity of psoriasis. Third, there may exist some other diseases aside from the six considered by the clinicians and the patients having symptoms of this disease are instead misdiagnosed to have psoriasis. 
+
+Second, the hypothesis that there may exist some other diseases aside from the six can also apply to cluster 7. This cluster is so dispersed that it looks like a combination of misdiagnosis and outliers. 
+
+Third, we also observe that disease class 2 seems to be quite difficult to differentiate from other disease classes, in particular, disease class 4. In general, this seems to agree with the clinicians' problem in differentiating these 6 disease classes. 
+
+Finally, we cannot ascertain the sources of this data set. From the input variables descriptions, we see that there is a possibility of subjective judgement that creep into the clinical predictors. For example, a patient with a lower level of itch tolerance may report a higher score as compared to one with higher tolerance. Clinicians from different practices may have different standards in scoring symptoms. This could be a reason why cluster 7 is so dispersed.
+
+A possible area of further study is to compute the average pairwise between-cluster distance in order to see how different are the clusters from one another, in particular, cluster 1 and 2. Further, one can also perform a more detailed analysis on the data points in cluster 7. Finally, one suggestion for the clinicians is to invite the patients back for more detailed tests. 
+
+
+```{r troublemakers}
+##############################################################
+# dataframes for each cluster with silh coeffs for individual
+  # data points
+# mainly to check on cluster 7
+##############################################################
+sil.coeff.df <- as.matrix.data.frame(sil.coeff) %>% 
+  as_tibble() %>% 
+  rename(cluster = V1,
+         neighbour = V2,
+         silhouette.coeff = V3) %>% 
+  bind_cols(tibble(class = data$class)) %>% 
+  group_by(cluster) %>% 
+  group_split()
+
+clus7 <- sil.coeff.df[[7]] %>% 
+  filter(silhouette.coeff <= 0)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r connectedComp, fig.cap="The corresponding number of connected components in the similarity graph to the number of neighbours.", fig.dim=c(4,2), include=FALSE}
+##############################################################
+# k-neighbours against number of connected components
+##############################################################
+ggplot(tibble(components = comp, k = seq.int(1, k.neigh)),
+       aes(x = k, y = components)) +
+  geom_point() +
+  labs(x = "no. of neighbours")
+```
+
+
+```{r separateComponents, eval=FALSE, include=FALSE}
+##############################################################
+# identify datapoints in each of the two components
+# construct dataframes of data points for each component
+##############################################################
+# retrieve similarity graph with k=5
+simgraph.k5 <- knn.graph(simMat, 5)[[1]] %>% 
+  graph_from_adjacency_matrix(., mode = "undirected")
+# retrieve the 2 components  in the similarity graph
+initial.clus <- tibble(component = components(simgraph.k5)$membership) %>% 
+  bind_cols(new.data)
+comp1 <- initial.clus %>% 
+  filter(component == 1)
+comp2 <- initial.clus %>% 
+  filter(component == 2)
+```
+
+
+```{r LaplacianComp1, eval=FALSE, include=FALSE}
+##############################################################
+# Spectral clustering of component 1
+##############################################################
+simMat.c1 <- dist(comp1[,3:36], method = "euclidean") %>% 
+  as.matrix()
+k.neigh.c1 <- 1
+graph.c1 <- knn.graph(simMat.c1, k.neigh.c1)
+comp.1 <- graph.c1[[2]]
+while(graph.c1[[2]] > 1) {
+  k.neigh.c1 <- k.neigh.c1 + 1
+  graph.c1 <- knn.graph(simMat.c1, k.neigh.c1)
+  comp.1 <- c(comp.1, graph.c1[[2]])
+}
+# weights matrix for all data points
+weights.c1 <- 1/simMat.c1^2 %>% 
+  replace(., col(.) == row(.), 1)
+
+# weights adjacency matrix
+W.c1 <- weights.c1*graph.c1[[1]]
+  
+# degree matrix 
+D.c1 <- diag(rowSums(W.c1))
+
+set.seed(123)
+# unnormalized Laplacian
+L.c1 <- D.c1 - W.c1
+# normalized Laplacian
+Lsym.c1 <- sqrt(solve(D.c1)) %*% L.c1 %*% sqrt(solve(D.c1))
+Lsym.decomp.c1 <- eigen(Lsym.c1, symmetric = TRUE)
+```
+
+
+```{r LaplacianComp2, eval=FALSE, include=FALSE}
+##############################################################
+# Spectral clustering of component 2
+##############################################################
+simMat.c2 <- dist(comp2[,3:36], method = "euclidean") %>% 
+  as.matrix()
+k.neigh.c2 <- 1
+graph.c2 <- knn.graph(simMat.c2, k.neigh.c2)
+comp.2 <- graph.c2[[2]]
+while(graph.c2[[2]] > 1) {
+  k.neigh.c2 <- k.neigh.c2 + 1
+  graph.c2 <- knn.graph(simMat.c2, k.neigh.c2)
+  comp.2 <- c(comp.2, graph.c2[[2]])
+}
+# weights matrix for all data points
+weights.c2 <- 1/simMat.c2^2 %>% 
+  replace(., col(.) == row(.), 1)
+
+# weights adjacency matrix
+W.c2 <- weights.c2*graph.c2[[1]]
+  
+# degree matrix 
+D.c2 <- diag(rowSums(W.c2))
+
+set.seed(123)
+# unnormalized Laplacian
+L.c2 <- D.c2 - W.c2
+# normalized Laplacian
+Lsym.c2 <- sqrt(solve(D.c2)) %*% L.c2 %*% sqrt(solve(D.c2))
+Lsym.decomp.c2 <- eigen(Lsym.c2, symmetric = TRUE)
+```
+
+
+
+
+
+```{r CompeigenvalPlot, fig.cap="LEFT: The first 10 eigenvalues of the normalized Laplacian of Component `; RIGHT: The first 10 eigenvalues of the normalized Laplacian of Component 2", fig.dim=c(6,3), eval=FALSE, include=FALSE}
+##############################################################
+# eigengap checks of the two components
+##############################################################
+#eigengap check of component 1
+comp1.plot <- ggplot(as_tibble(Lsym.decomp.c1$values[53:44],
+                               .name_repair = "unique"), 
+       aes(x = as.factor(seq(1,10)), y = value)) +
+  geom_point() +
+  labs(title = "Component 1",
+       x = "Index")
+#eigengap check of component 2
+comp2.plot <- ggplot(as_tibble(Lsym.decomp.c2$values[305:296],
+                               .name_repair = "unique"), 
+       aes(x = as.factor(seq(1,10)), y = value)) +
+  geom_point() +
+  labs(title = "Component 2",
+       x = "Index")
+grid.arrange(comp1.plot, comp2.plot, ncol = 2)
+```
+
+```{r UmatComp2, eval=FALSE, include=FALSE}
+##############################################################
+# U matrix of component 2
+##############################################################
+# based on the eigengap heuristics, cluster k=6
+U.mat.c2 <- as_tibble(Lsym.decomp.c2$vectors[,305:300]) %>% 
+  mutate(across(everything(), 
+                ~. / sqrt(V1^2 + V2^2 + V3^2 + V4^2 + V5^2 +
+                            V6^2))) %>% 
+  rename_with(., ~gsub("V", "U",.x))
+```
+
+
+```{r UmatPlots.c2, fig.cap="Component 2: Second dimension of the U matrix against the rest of 4 other dimensions. U matrix is obtained from the normalized Laplacian.", eval=FALSE, include=FALSE}
+##############################################################
+# plots of second eigenvec of Lsym against 4 other smallest
+##############################################################
+vec.list.c2 <- map(seq.int(3, 6), ~paste0("U", .x))
+vec.nr.c2 <- seq.int(3,6)
+project.c2 <- map2(vec.list.c2, vec.nr.c2,
+                  ~ggplot(U.mat.c2, 
+                          aes(x = U2)) +
+  geom_point(aes_string(y = .x)) +
+  labs(x = "U2",
+       y = paste0("U", .y)))
+
+grid.arrange(grobs = project.c2, nrow = 2)
+```
+
+
+```{r kmeans.c2, fig.cap="Spectral clustering results of Component 2 with k=6 clusters. The number of clusters to use is derived from eigengap heuristics.", eval=FALSE, include=FALSE}
+##############################################################
+# clustering using kmeans
+# only for own reference. 
+##############################################################
+set.seed(123)
+kmeans.c2 <- kmeans(as.matrix(U.mat.c2), centers = 6) 
+clus.c2 <- comp2 %>% 
+  dplyr::select(class) %>% 
+  mutate(cluster = as.factor(kmeans.c2$cluster)) %>% 
+  group_by(cluster) %>% 
+  group_split()
+
+clus.plots.c2 <- map2(clus.c2, 
+                   seq(1, 6), ~ggplot(.x, aes(as.factor(class))) +
+                    geom_bar() + 
+                    labs(title = paste0("cluster", .y),
+                         x = "disease class"))
+grid.arrange(grobs = clus.plots.c2, nrow = 2)
+```
+
+
+
+## REFERENCES
+
+1. *Hastie, T., Tibshirani and R., Friedman, J.*. 2017. The Elements of Statistical Learning: Data Mining, Inference, and Prediction (Springer Series in Statistics). Springer.
+
+2. *von Luxburg, U*. 2006. A Tutorial on Spectral Clustering. Technical Report No. TR-149.
+Max Planck Institute for Biological Cybernetics.
+
+
+
+
+
+
+
+
+
+
+
+
+
+\pagebreak
+
+# Appendix
+
+## Predictor variables list
+
+\underline{Clinical Predictors} (take values 0, 1, 2, 3 unless otherwise stated)
+
+V1: erythema
+
+V2: scaling
+
+V3: definite borders
+
+V4: itching
+
+V5: koebner phenomenon
+
+V6: polygonal papules
+
+V7: follicular papules
+
+V8: oral mucosal involvement
+
+V9: knee and elbow involvement
+
+V10: scalp involvement
+
+V11: family history (0 or 1)
+
+V34: Age (linear)
+
+\underline{Histopathological Predictors} (take values 0, 1, 2, 3)
+
+V12: melanin incontinence
+
+V13: eosinophils in the infiltrate
+
+V14: PNL infiltrate
+
+V15: fibrosis of the papillary dermis
+
+V16: exocytosis
+
+V17: acanthosis
+
+V18: hyperkeratosis
+
+V19: parakeratosis
+
+V20: clubbing of the rete ridges
+
+V21: elongation of the rete ridges
+
+V22: thinning of the suprapapillary epidermis
+
+V23: spongiform pustule
+
+V24: munro microabcess
+
+V25: focal hypergranulosis
+
+V26: disappearance of the granular layer
+
+V27: vacuolisation and damage of basal layer
+
+V28: spongiosis
+
+V29: saw-tooth appearance of retes
+
+V30: follicular horn plug
+
+V31: perifollicular parakeratosis
+
+V32: inflammatory monoluclear inflitrate
+
+V33: band-like infiltrate
+
+
+```{r ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE} 
+```
